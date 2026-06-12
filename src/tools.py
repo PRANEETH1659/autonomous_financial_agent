@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+import shutil
 
 
 def get_stock_info(ticker: str) -> str:
@@ -121,6 +124,48 @@ def chunk_text(text: str):
 
     chunks = text_splitter.create_documents([text])
     return [chunk.page_content for chunk in chunks]
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+import shutil
+
+# 1. Initialize the Free Embedding Model (Runs on your CPU)
+# 'all-MiniLM-L6-v2' is small, fast, and great for resumes.
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+# 2. Define where to store the database on your computer
+PERSIST_DIRECTORY = "./chroma_db"
+
+def store_in_vector_db(chunks: list, collection_name: str = "financial_research"):
+    """
+    Takes text chunks, converts them to embeddings, and stores them in ChromaDB.
+    """
+    try:
+        # Clear existing database to avoid mixing data during testing
+        if os.path.exists(PERSIST_DIRECTORY):
+            shutil.rmtree(PERSIST_DIRECTORY)
+        
+        # Create the vector store
+        vector_db = Chroma.from_texts(
+            chunks,
+            embeddings,
+            persist_directory=PERSIST_DIRECTORY,
+            collection_name=collection_name
+        )
+        return vector_db
+    except Exception as e:
+        print(f"Error storing in Vector DB: {e}")
+        return None
+
+def get_vector_db(collection_name: str = "financial_research"):
+    """
+    Loads the existing vector database from disk.
+    """
+    return Chroma(
+        persist_directory=PERSIST_DIRECTORY,
+        embedding_function=embeddings,
+        collection_name=collection_name
+    )
+
 
 
 if __name__ == "__main__":
@@ -146,3 +191,19 @@ if __name__ == "__main__":
     print("\n--- Testing Text Chunking ---")
     chunks = chunk_text(scraped_text)
     print(f"Generated {len(chunks)} chunks. First chunk:\n{chunks[0]}")
+
+        # Test Day 2
+    print("\n--- Testing Vector DB ---")
+    test_chunks = [
+        "Apple announced a new AI chip today.",
+        "The stock market is seeing high volatility.",
+        "Nvidia is leading the GPU market for AI training."
+    ]
+    vector_db = store_in_vector_db(test_chunks)
+
+    # Search for something related but NOT using the exact words
+    query = "Tell me about computer hardware for artificial intelligence"
+    docs = vector_db.similarity_search(query, k=1)
+
+    print(f"Query: {query}")
+    print(f"Most relevant chunk found: {docs[0].page_content}")
