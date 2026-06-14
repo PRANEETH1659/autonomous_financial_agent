@@ -166,44 +166,112 @@ def get_vector_db(collection_name: str = "financial_research"):
         collection_name=collection_name
     )
 
+def retrieve_context(query:str,k:int=3):
+    
+    """
+    Takes a query, searches the Vector DB, and returns a formatted string of context.
+    """
+    
+    try:
+        
+        #1 Load the database
+        db=get_vector_db()
+        
+        #2.search for top-k similar docs
+        
+        docs=db.similarity_search(query,k=k)
+        
+        #3.combine the snippets into 1 context block
+        context= "\n---\n".join([doc.page_content for doc in docs])
+        
+        return context
+
+    except Exception as e:
+        return f"Error retrieving context :{e}"
+
+def process_research(query:str):
+    
+    """
+    The full Phase 2 Pipeline: Search -> Scrape -> Chunk -> Store -> Retrieve
+    """
+    
+    #1.Search 
+    print(f"Searching for :{query:}")
+    search_results=perform_web_search(query)
+    
+    
+    #2.Scrape 
+    # For this simple version, we'll just scrape the first result's link
+    #In a real app, you'd loop through all results.
+    
+    import re
+    links= re.findall(r'Link:\s*(https?://\S+)',search_results)
+    
+    if not links:
+        return "No links found to research."
+    
+    
+    raw_text=None 
+    for link in links:
+        print(f"Trying ot scrape :{link}")
+        scraped = scrape_website(link)
+        if not scraped.startswith("Failed to retrieve") and not scraped.startswith("Error"):
+            raw_text=scraped
+            break 
+    
+    if not raw_text:
+        return "All Links are getting blocked. Try New URL..."
+
+    #3.Chunks 
+    chunks=chunk_text(raw_text)
+    
+    #4 . Store in Chroma
+    store_in_vector_db(chunks)
+    
+    #5.Retrive
+    context= retrieve_context(query)
+    
+    return context
 
 
 if __name__ == "__main__":
     load_dotenv()
 
-    print("\n--- Testing Financial Data Tool ---")
-    apple_info = get_stock_info("AAPL")
-    print(apple_info)
+    # print("\n--- Testing Financial Data Tool ---")
+    # apple_info = get_stock_info("AAPL")
+    # print(apple_info)
 
-    print("\n--- Testing Web Search Tool ---")
-    news_query = "latest news on Apple Inc."
-    apple_news = perform_web_search(news_query)
-    print(apple_news)
+    # print("\n--- Testing Web Search Tool ---")
+    # news_query = "latest news on Apple Inc."
+    # apple_news = perform_web_search(news_query)
+    # print(apple_news)
 
-    print("\n--- Testing Invalid Search ---")
-    invalid_search = perform_web_search("asdfghjklqwertyuiopzxcvbnm_nonexistent_query")
-    print(invalid_search)
+    # print("\n--- Testing Invalid Search ---")
+    # invalid_search = perform_web_search("asdfghjklqwertyuiopzxcvbnm_nonexistent_query")
+    # print(invalid_search)
 
-    print("\n--- Testing Web Scraper ---")
-    scraped_text = scrape_website("https://en.wikipedia.org/wiki/Artificial_intelligence")
-    print(scraped_text[:500], "...")  # print first 500 chars
+    # print("\n--- Testing Web Scraper ---")
+    # scraped_text = scrape_website("https://en.wikipedia.org/wiki/Artificial_intelligence")
+    # print(scraped_text[:500], "...")  # print first 500 chars
 
-    print("\n--- Testing Text Chunking ---")
-    chunks = chunk_text(scraped_text)
-    print(f"Generated {len(chunks)} chunks. First chunk:\n{chunks[0]}")
+    # print("\n--- Testing Text Chunking ---")
+    # chunks = chunk_text(scraped_text)
+    # print(f"Generated {len(chunks)} chunks. First chunk:\n{chunks[0]}")
 
-        # Test Day 2
-    print("\n--- Testing Vector DB ---")
-    test_chunks = [
-        "Apple announced a new AI chip today.",
-        "The stock market is seeing high volatility.",
-        "Nvidia is leading the GPU market for AI training."
-    ]
-    vector_db = store_in_vector_db(test_chunks)
+    #     # Test Day 2
+    # print("\n--- Testing Vector DB ---")
+    # test_chunks = [
+    #     "Apple announced a new AI chip today.",
+    #     "The stock market is seeing high volatility.",
+    #     "Nvidia is leading the GPU market for AI training."
+    # ]
+    # vector_db = store_in_vector_db(test_chunks)
 
-    # Search for something related but NOT using the exact words
-    query = "Tell me about computer hardware for artificial intelligence"
-    docs = vector_db.similarity_search(query, k=1)
+    # # Search for something related but NOT using the exact words
+    # query = "Tell me about computer hardware for artificial intelligence"
+    # docs = vector_db.similarity_search(query, k=1)
 
-    print(f"Query: {query}")
-    print(f"Most relevant chunk found: {docs[0].page_content}")
+    # print(f"Query: {query}")
+    # print(f"Most relevant chunk found: {docs[0].page_content}")
+    
+    print(process_research("Tesla's 2024 production goals"))
