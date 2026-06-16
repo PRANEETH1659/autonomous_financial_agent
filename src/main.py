@@ -73,8 +73,4 @@ agent_executor = AgentExecutor(
     memory=memory
 )
 
-print("\n -- Testing the Agent ---")
-response = agent_executor.invoke({
-    "input": "What is the current stock price of Reliance Industries and Who is the CEO Of Relinace Industries "
-})
-print(response["output"])
+
