@@ -9,9 +9,10 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_core.tools import tool
 import shutil
 
-
+@tool
 def get_stock_info(ticker: str) -> str:
     """Fetches current and historical stock information for a given ticker symbol.
     Returns a string summary of the stock's performance."""
@@ -58,7 +59,7 @@ def get_stock_info(ticker: str) -> str:
     except Exception as e:
         return f"Error fetching stock info for {ticker}: {e}"
 
-
+@tool
 def perform_web_search(query: str) -> str:
     """Performs a web search using Serper.dev and returns the top results."""
     try:
@@ -124,6 +125,9 @@ def chunk_text(text: str):
 
     chunks = text_splitter.create_documents([text])
     return [chunk.page_content for chunk in chunks]
+
+
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 import shutil
@@ -189,6 +193,7 @@ def retrieve_context(query:str,k:int=3):
     except Exception as e:
         return f"Error retrieving context :{e}"
 
+@tool
 def process_research(query:str):
     
     """
