@@ -10,7 +10,7 @@ from langchain_core.prompts  import PromptTemplate
 from langchain.agents import create_react_agent
 from langchain.agents import tool
 from langchain.agents.agent import AgentExecutor
-
+from langchain.memory import ConversationBufferMemory
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,10 +26,19 @@ llm = ChatGroq(
 tools = [get_stock_info, perform_web_search, process_research]
 
 
+#Initializing Memory
+#Memory_key  must watch the vairable in your template!!!
+
+memory= ConversationBufferMemory(memory_key="chat_history",return_messages=True)
+
 # Define the ReAct prompt manually (No more Hub errors!)
 template = """Answer the following questions as best you can. You have access to the following tools:
 
 {tools}
+
+Previous Conversation History
+
+{chat_history}
 
 Use the following format:
 
@@ -48,8 +57,7 @@ Question: {input}
 Thought: {agent_scratchpad}"""
 
 
-# 3. Bind tools to the LLM
-llm_with_tools = llm.bind_tools(tools)
+
 
 # ✅ Pull the prompt from LangChain Hub
 prompt = PromptTemplate.from_template(template)
@@ -61,11 +69,12 @@ agent_executor = AgentExecutor(
     agent=agent,
     tools=tools,
     verbose=True,
-    handle_parsing_errors=True
+    handle_parsing_errors=True,
+    memory=memory
 )
 
 print("\n -- Testing the Agent ---")
 response = agent_executor.invoke({
-    "input": "What is the current stock price of Reliance Industries and what is the latest news about Reliance Telecommunication (JIO)"
+    "input": "What is the current stock price of Reliance Industries and Who is the CEO Of Relinace Industries "
 })
 print(response["output"])
