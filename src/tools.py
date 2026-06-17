@@ -117,8 +117,8 @@ def scrape_website(url: str) -> str:
 def chunk_text(text: str):
     """Splits long text into overlapping chunks for processing."""
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,    # reasonable size
-        chunk_overlap=100,  # overlap for context
+        chunk_size=500,    # reasonable size
+        chunk_overlap=50,  # overlap for context
         length_function=len,
         is_separator_regex=False,
     )
@@ -170,7 +170,7 @@ def get_vector_db(collection_name: str = "financial_research"):
         collection_name=collection_name
     )
 
-def retrieve_context(query:str,k:int=3):
+def retrieve_context(query:str,k:int=2):
     
     """
     Takes a query, searches the Vector DB, and returns a formatted string of context.
