@@ -25,6 +25,10 @@ def get_stock_info(ticker: str) -> str:
         sector = info.get('sector', 'N/A')
         industry = info.get('industry', 'N/A')
         market_cap = info.get('marketCap', 'N/A')
+        if isinstance(market_cap, (int, float)):
+            market_cap_display = f"{market_cap:,}"
+        else:
+            market_cap_display = "N/A"
 
         hist = stock.history(period="7d")
 
@@ -47,7 +51,7 @@ def get_stock_info(ticker: str) -> str:
         summary = (
             f"Company: {company_name} ({ticker})\n"
             f"Sector: {sector}, Industry: {industry}\n"
-            f"Market Cap: {market_cap:,}\n"
+            f"Market Cap: {market_cap_display}\n"
             f"Current Price: {current_price}\n"
             f"Last Trading Day (Open: {last_open}, Close: {last_close}, "
             f"High: {last_high}, Low: {last_low})\n"
@@ -72,7 +76,7 @@ def perform_web_search(query: str) -> str:
 
         formatted_results = []
         if 'organic' in results:
-            for i, res in enumerate(results['organic'][:5]):  # Top 5 results
+            for i, res in enumerate(results['organic'][:3]):  # Top 5 results
                 title = res.get('title', 'No Title')
                 link = res.get('link', 'No Link')
                 snippet = res.get('snippet', 'No Snippet')
@@ -201,9 +205,9 @@ def process_research(query:str):
     """
     
     #1.Search 
-    print(f"Searching for :{query:}")
-    search_results=perform_web_search(query)
-    
+    print(f"\n[STEP 1] Searching Web for : {query}")
+    search_results=perform_web_search.invoke(query)
+    print("[✓] Search Completed")
     
     #2.Scrape 
     # For this simple version, we'll just scrape the first result's link
@@ -218,7 +222,7 @@ def process_research(query:str):
     
     raw_text=None 
     for link in links:
-        print(f"Trying ot scrape :{link}")
+        print(f"\n[STEP 2] Scraping: {link}")
         scraped = scrape_website(link)
         if not scraped.startswith("Failed to retrieve") and not scraped.startswith("Error"):
             raw_text=scraped
@@ -226,17 +230,29 @@ def process_research(query:str):
     
     if not raw_text:
         return "All Links are getting blocked. Try New URL..."
+    
+    print("[✓] Scraping Successful")
+    print(f"Characters Extracted: {len(raw_text)}")
 
     #3.Chunks 
-    chunks=chunk_text(raw_text)
+    print("\n[STEP 3] Chunking Text...")
+    chunks = chunk_text(raw_text)
+
+    print(f"[✓] Created {len(chunks)} chunks")
     
     #4 . Store in Chroma
+    print("\n[STEP 4] Storing Embeddings in ChromaDB...")
     store_in_vector_db(chunks)
+    print("[✓] Stored Successfully")
     
     #5.Retrive
-    context= retrieve_context(query)
+    print("\n[STEP 5] Retrieving Relevant Context...")
+    context = retrieve_context(query)
+    print("[✓] Context Retrieved")
     
-    return context
+    print("\n========== RETRIEVED CONTEXT ==========")
+    return(context[:500])
+    
 
 
 if __name__ == "__main__":
@@ -279,4 +295,4 @@ if __name__ == "__main__":
     # print(f"Query: {query}")
     # print(f"Most relevant chunk found: {docs[0].page_content}")
     
-    print(process_research("Tesla's 2024 production goals"))
+    

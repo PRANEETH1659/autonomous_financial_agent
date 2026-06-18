@@ -51,8 +51,23 @@ Observation: result of the action
 
 (Thought/Action/Observation can repeat)
 
+When comparing companies, provide:
+- Industry
+- Market Capitalization
+- Recent Performance
+- Key Strengths
+- Key Risks
+- Overall Comparison
+
 IMPORTANT:
 Use at most 2 tool calls before producing a Final Answer.
+
+IMPORTANT:
+If the user's query appears to be random text, gibberish,
+or unrelated to finance, investing, companies, stocks,
+or business research, do not call any tools.
+Respond that no meaningful financial query was detected.
+
 
 Thought: I now know the final answer
 
@@ -76,7 +91,7 @@ agent_executor = AgentExecutor(
     tools=tools,
     verbose=True,
     handle_parsing_errors=True,
-    max_iterations=3
+    max_iterations=5
 )
 
 
