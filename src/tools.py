@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import os
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -67,7 +68,7 @@ def get_stock_info(ticker: str) -> str:
 def perform_web_search(query: str) -> str:
     """Performs a web search using Serper.dev and returns the top results."""
     try:
-        serper_api_key = os.getenv("SERPER_API_KEY")
+        serper_api_key = st.secrets["SERPER_API_KEY"]
         if not serper_api_key:
             return "Error: SERPER_API_KEY not found in environment variables."
 
