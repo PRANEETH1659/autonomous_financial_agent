@@ -8,10 +8,12 @@ from datetime import datetime, timedelta
 
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
 from langchain_core.tools import tool
-import shutil
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
 
 @tool
 def get_stock_info(ticker: str) -> str:
@@ -64,6 +66,7 @@ def get_stock_info(ticker: str) -> str:
     except Exception as e:
         return f"Error fetching stock info for {ticker}: {e}"
 
+
 @tool
 def perform_web_search(query: str) -> str:
     """Performs a web search using Serper.dev and returns the top results."""
@@ -78,7 +81,7 @@ def perform_web_search(query: str) -> str:
 
         formatted_results = []
         if 'organic' in results:
-            for i, res in enumerate(results['organic'][:3]):  # Top 5 results
+            for i, res in enumerate(results['organic'][:3]):  # Top 3 results
                 title = res.get('title', 'No Title')
                 link = res.get('link', 'No Link')
                 snippet = res.get('snippet', 'No Snippet')
@@ -123,8 +126,8 @@ def scrape_website(url: str) -> str:
 def chunk_text(text: str):
     """Splits long text into overlapping chunks for processing."""
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,    # reasonable size
-        chunk_overlap=50,  # overlap for context
+        chunk_size=500,
+        chunk_overlap=50,
         length_function=len,
         is_separator_regex=False,
     )
@@ -133,168 +136,110 @@ def chunk_text(text: str):
     return [chunk.page_content for chunk in chunks]
 
 
+# ----------------------------------------------------------------------
+# TF-IDF based "vector store" replacement (no chromadb, no torch,
+# no sentence-transformers). Stored in memory per Streamlit session.
+# ----------------------------------------------------------------------
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-import shutil
+_chunk_store = {}
 
-# 1. Initialize the Free Embedding Model (Runs on your CPU)
-# 'all-MiniLM-L6-v2' is small, fast, and great for resumes.
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-# 2. Define where to store the database on your computer
-PERSIST_DIRECTORY = "./chroma_db"
 
 def store_in_vector_db(chunks: list, collection_name: str = "financial_research"):
     """
-    Takes text chunks, converts them to embeddings, and stores them in ChromaDB.
+    Takes text chunks and builds a TF-IDF matrix for similarity search.
+    Replaces the old ChromaDB + HuggingFace embeddings implementation.
     """
     try:
-        # Clear existing database to avoid mixing data during testing
-        if os.path.exists(PERSIST_DIRECTORY):
-            shutil.rmtree(PERSIST_DIRECTORY)
-        
-        # Create the vector store
-        vector_db = Chroma.from_texts(
-            chunks,
-            embeddings,
-            persist_directory=PERSIST_DIRECTORY,
-            collection_name=collection_name
-        )
-        return vector_db
+        if not chunks:
+            return None
+
+        vectorizer = TfidfVectorizer(stop_words='english')
+        matrix = vectorizer.fit_transform(chunks)
+
+        _chunk_store[collection_name] = {
+            "chunks": chunks,
+            "vectorizer": vectorizer,
+            "matrix": matrix,
+        }
+        return _chunk_store[collection_name]
+
     except Exception as e:
         print(f"Error storing in Vector DB: {e}")
         return None
 
-def get_vector_db(collection_name: str = "financial_research"):
-    """
-    Loads the existing vector database from disk.
-    """
-    return Chroma(
-        persist_directory=PERSIST_DIRECTORY,
-        embedding_function=embeddings,
-        collection_name=collection_name
-    )
 
-def retrieve_context(query:str,k:int=2):
-    
+def retrieve_context(query: str, k: int = 2, collection_name: str = "financial_research"):
     """
-    Takes a query, searches the Vector DB, and returns a formatted string of context.
+    Takes a query, computes cosine similarity against stored TF-IDF vectors,
+    and returns the top-k most relevant chunks as a formatted string.
     """
-    
     try:
-        
-        #1 Load the database
-        db=get_vector_db()
-        
-        #2.search for top-k similar docs
-        
-        docs=db.similarity_search(query,k=k)
-        
-        #3.combine the snippets into 1 context block
-        context= "\n---\n".join([doc.page_content for doc in docs])
-        
+        store = _chunk_store.get(collection_name)
+        if not store:
+            return "No data stored yet."
+
+        query_vec = store["vectorizer"].transform([query])
+        scores = cosine_similarity(query_vec, store["matrix"]).flatten()
+
+        k = min(k, len(store["chunks"]))
+        top_idx = np.argsort(scores)[-k:][::-1]
+
+        context = "\n---\n".join([store["chunks"][i] for i in top_idx])
         return context
 
     except Exception as e:
-        return f"Error retrieving context :{e}"
+        return f"Error retrieving context: {e}"
+
 
 @tool
-def process_research(query:str):
-    
+def process_research(query: str):
     """
     The full Phase 2 Pipeline: Search -> Scrape -> Chunk -> Store -> Retrieve
     """
-    
-    #1.Search 
+
+    # 1. Search
     print(f"\n[STEP 1] Searching Web for : {query}")
-    search_results=perform_web_search.invoke(query)
-    print("[✓] Search Completed")
-    
-    #2.Scrape 
-    # For this simple version, we'll just scrape the first result's link
-    #In a real app, you'd loop through all results.
-    
+    search_results = perform_web_search.invoke(query)
+    print("[OK] Search Completed")
+
+    # 2. Scrape
     import re
-    links= re.findall(r'Link:\s*(https?://\S+)',search_results)
-    
+    links = re.findall(r'Link:\s*(https?://\S+)', search_results)
+
     if not links:
         return "No links found to research."
-    
-    
-    raw_text=None 
+
+    raw_text = None
     for link in links:
         print(f"\n[STEP 2] Scraping: {link}")
         scraped = scrape_website(link)
         if not scraped.startswith("Failed to retrieve") and not scraped.startswith("Error"):
-            raw_text=scraped
-            break 
-    
+            raw_text = scraped
+            break
+
     if not raw_text:
         return "All Links are getting blocked. Try New URL..."
-    
-    print("[✓] Scraping Successful")
+
+    print("[OK] Scraping Successful")
     print(f"Characters Extracted: {len(raw_text)}")
 
-    #3.Chunks 
+    # 3. Chunk
     print("\n[STEP 3] Chunking Text...")
     chunks = chunk_text(raw_text)
+    print(f"[OK] Created {len(chunks)} chunks")
 
-    print(f"[✓] Created {len(chunks)} chunks")
-    
-    #4 . Store in Chroma
-    print("\n[STEP 4] Storing Embeddings in ChromaDB...")
+    # 4. Store (TF-IDF)
+    print("\n[STEP 4] Building TF-IDF Index...")
     store_in_vector_db(chunks)
-    print("[✓] Stored Successfully")
-    
-    #5.Retrive
+    print("[OK] Stored Successfully")
+
+    # 5. Retrieve
     print("\n[STEP 5] Retrieving Relevant Context...")
     context = retrieve_context(query)
-    print("[✓] Context Retrieved")
-    
-    print("\n========== RETRIEVED CONTEXT ==========")
-    return(context[:500])
-    
+    print("[OK] Context Retrieved")
+
+    return context[:500]
 
 
 if __name__ == "__main__":
-    load_dotenv()
-
-    # print("\n--- Testing Financial Data Tool ---")
-    # apple_info = get_stock_info("AAPL")
-    # print(apple_info)
-
-    # print("\n--- Testing Web Search Tool ---")
-    # news_query = "latest news on Apple Inc."
-    # apple_news = perform_web_search(news_query)
-    # print(apple_news)
-
-    # print("\n--- Testing Invalid Search ---")
-    # invalid_search = perform_web_search("asdfghjklqwertyuiopzxcvbnm_nonexistent_query")
-    # print(invalid_search)
-
-    # print("\n--- Testing Web Scraper ---")
-    # scraped_text = scrape_website("https://en.wikipedia.org/wiki/Artificial_intelligence")
-    # print(scraped_text[:500], "...")  # print first 500 chars
-
-    # print("\n--- Testing Text Chunking ---")
-    # chunks = chunk_text(scraped_text)
-    # print(f"Generated {len(chunks)} chunks. First chunk:\n{chunks[0]}")
-
-    #     # Test Day 2
-    # print("\n--- Testing Vector DB ---")
-    # test_chunks = [
-    #     "Apple announced a new AI chip today.",
-    #     "The stock market is seeing high volatility.",
-    #     "Nvidia is leading the GPU market for AI training."
-    # ]
-    # vector_db = store_in_vector_db(test_chunks)
-
-    # # Search for something related but NOT using the exact words
-    # query = "Tell me about computer hardware for artificial intelligence"
-    # docs = vector_db.similarity_search(query, k=1)
-
-    # print(f"Query: {query}")
-    # print(f"Most relevant chunk found: {docs[0].page_content}")
-    
-    
+    pass
