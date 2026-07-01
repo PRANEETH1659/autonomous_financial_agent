@@ -1,5 +1,6 @@
 import streamlit as st
 from langchain_groq import ChatGroq
+from langchain.memory import ConversationBufferMemory
 
 from tools import (
 get_stock_info,
@@ -57,19 +58,18 @@ IMPORTANT:
 * Never invent tool names.
 * Always finish with Final Answer.
 
-For company comparisons provide:
-
-* Industry
-* Market Cap
-* Recent Performance
-* Key Strengths
-* Key Risks
-* Overall Comparison
+Only use the comparison format (Industry/Market Cap/Strengths/Risks/Overall) 
+when the user EXPLICITLY asks to compare two or more companies. 
+For single company or general queries, respond in plain concise paragraphs.
 
 If the query is unrelated to finance,
 investing, stocks, companies, or business:
 
 Final Answer: No meaningful financial query detected.
+
+Previous conversation:
+{chat_history}
+
 
 Question: {input}
 
@@ -84,10 +84,16 @@ tools,
 prompt
 )
 
+memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    return_messages=True
+)
+
 agent_executor = AgentExecutor(
 agent=agent,
 tools=tools,
 verbose=False,
 handle_parsing_errors="Please provide a Final Answer.",
-max_iterations=5
+max_iterations=5,
+memory=memory
 )
