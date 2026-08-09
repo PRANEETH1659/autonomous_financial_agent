@@ -87,6 +87,7 @@ agent_executor = AgentExecutor(
     tools=tools,
     verbose=False,
     handle_parsing_errors="Please provide a Final Answer.",
-    max_iterations=5,
+    max_iterations=15,
+    early_stopping_method="generate",
     memory=memory
 )
