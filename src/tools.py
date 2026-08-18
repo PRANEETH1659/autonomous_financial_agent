@@ -2,26 +2,50 @@ import re
 import logging
 import yfinance as yf
 import pandas as pd
-import os
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.tools import tool
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi
+from pypdf import PdfReader
 import numpy as np
 
 logger = logging.getLogger(__name__)
+# Streamlit installs its own root-logger handlers before this module is
+# imported, which makes a plain basicConfig() a silent no-op (it only acts
+# when the root logger has no handlers) - that's why app-level INFO logs were
+# invisible in production. Configuring this logger directly sidesteps the root
+# logger entirely, so these lines appear regardless of Streamlit's setup.
 if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+# Lets the UI show live pipeline progress. Assumes a single active research
+# session at a time (fine for this app's usage) - not safe for concurrent users.
+_progress_callback = None
+
+
+def set_progress_callback(callback):
+    """Registers a callback(str) invoked at each process_research step. Pass
+    None to clear it once a research call finishes."""
+    global _progress_callback
+    _progress_callback = callback
+
+
+def _report(message: str) -> None:
+    logger.info(message)
+    if _progress_callback:
+        _progress_callback(message)
+
 
 TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
@@ -65,10 +89,7 @@ def _format_number(value, suffix: str = "") -> str:
     return "N/A"
 
 
-@tool
-def get_stock_info(ticker: str) -> str:
-    """Fetches current price, valuation metrics, and recent performance for a given ticker symbol.
-    Returns a string summary of the stock's performance."""
+def _get_stock_info_for_one(ticker: str) -> str:
     normalized = validate_ticker(ticker)
     if not normalized:
         return f"Could not find valid stock data: '{ticker}' is not a valid ticker symbol format."
@@ -131,14 +152,51 @@ def get_stock_info(ticker: str) -> str:
     return summary
 
 
+def get_stock_summary(ticker: str) -> str:
+    """Public single-ticker summary, used by the UI's zero-LLM fast path."""
+    return _get_stock_info_for_one(ticker)
+
+
 @tool
-def perform_web_search(query: str) -> str:
-    """Performs a web search using Serper.dev and returns the top results."""
+def get_stock_info(tickers: str) -> str:
+    """Fetches current price, valuation metrics, and recent performance for
+    one or more stock tickers. Pass a single ticker (e.g. 'AAPL') or, when
+    comparing companies, ALL tickers comma-separated in one call
+    (e.g. 'TSLA, NVDA, AAPL') instead of calling this tool once per company.
+    Returns one summary per ticker."""
+    # Dedupe while preserving order: the agent sometimes re-issues a ticker
+    # twice in one call after a format retry, and each duplicate would
+    # otherwise cost a redundant yfinance round-trip.
+    seen = set()
+    ticker_list = []
+    for t in tickers.split(","):
+        t = t.strip()
+        if t and t.upper() not in seen:
+            seen.add(t.upper())
+            ticker_list.append(t)
+
+    if not ticker_list:
+        return f"Could not find valid stock data: '{tickers}' is not a valid ticker symbol format."
+
+    return "\n---\n".join(_get_stock_info_for_one(t) for t in ticker_list)
+
+
+class SearchError(Exception):
+    """Raised when a web search fails. Raised rather than returned as a string
+    so st.cache_data does not cache the failure - a cached error would keep a
+    transient Serper outage 'sticky' for the full 10-minute TTL."""
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _search_web(query: str) -> str:
+    """Cached Serper lookup (10 min TTL). Shared by perform_web_search and
+    process_research so an escalation from one to the other on the same
+    query doesn't pay for a second identical API round-trip."""
     try:
         serper_api_key = st.secrets.get("SERPER_API_KEY")
 
         if not serper_api_key:
-            return "Error: SERPER_API_KEY not found in Streamlit secrets."
+            raise SearchError("Error: SERPER_API_KEY not found in Streamlit secrets.")
 
         search = GoogleSerperAPIWrapper(serper_api_key=serper_api_key)
         results = search.results(query)
@@ -160,14 +218,75 @@ def perform_web_search(query: str) -> str:
 
     except requests.exceptions.RequestException as e:
         logger.warning("Web search network error for '%s': %s", query, e)
-        return f"Error performing web search for '{query}': network issue, please try again."
+        raise SearchError(
+            f"Error performing web search for '{query}': network issue, please try again."
+        ) from e
+    except SearchError:
+        raise
     except Exception as e:
         logger.exception("Unexpected error performing web search for '%s'", query)
-        return f"Error performing web search for '{query}': {e}"
+        raise SearchError(f"Error performing web search for '{query}': {e}") from e
 
 
-def scrape_website(url: str, retries: int = 1, timeout: int = 10) -> str:
-    """Scrapes text content from a webpage, retrying once on transient network errors."""
+@tool
+def perform_web_search(query: str) -> str:
+    """Answers questions using a quick web search of headlines and snippets.
+    Best for simple, factual, current-events questions (e.g. 'why did Tesla
+    stock drop today'). If the user asks for deep research, analysis, or a
+    detailed summary of a topic, use process_research instead - do NOT call
+    both tools for the same question."""
+    try:
+        return _search_web(query)
+    except SearchError as e:
+        return str(e)
+
+
+FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
+
+
+def _scrape_with_firecrawl(url: str, api_key: str, timeout: int) -> str | None:
+    """Single Firecrawl scrape attempt. Returns markdown content, or None on
+    any failure (network error, non-200, empty content) so the caller can
+    retry or fall back."""
+    try:
+        response = requests.post(
+            FIRECRAWL_SCRAPE_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"url": url, "formats": ["markdown"], "timeout": timeout * 1000},
+            timeout=timeout + 15,
+        )
+    except requests.exceptions.RequestException as e:
+        logger.warning("Firecrawl request failed for %s: %s", url, e)
+        return None
+
+    if response.status_code != 200:
+        logger.warning("Firecrawl returned HTTP %d for %s", response.status_code, url)
+        return None
+
+    # A 200 doesn't guarantee JSON - a proxy or CDN error page would make
+    # .json() raise, which previously escaped this function and crashed the
+    # whole research pipeline instead of falling back to the bs4 scraper.
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.warning("Firecrawl returned non-JSON body for %s", url)
+        return None
+
+    if not isinstance(payload, dict):
+        logger.warning("Firecrawl returned unexpected JSON shape for %s", url)
+        return None
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    markdown = data.get("markdown")
+    return markdown or None
+
+
+def _scrape_with_bs4(url: str, retries: int, timeout: int) -> str:
+    """Fallback scraper: raw HTML fetch + <p> tag extraction. Used when
+    Firecrawl has no key configured, or fails after its retries."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -191,12 +310,36 @@ def scrape_website(url: str, retries: int = 1, timeout: int = 10) -> str:
             return page_text if page_text else "No content found on this page."
 
         except requests.exceptions.RequestException as e:
-            logger.warning("Scrape attempt %d/%d failed for %s: %s", attempt, attempts, url, e)
+            logger.warning("bs4 scrape attempt %d/%d failed for %s: %s", attempt, attempts, url, e)
             if attempt == attempts:
                 return f"Error during scraping: {e}"
         except Exception as e:
             logger.exception("Unexpected error scraping %s", url)
             return f"Error during scraping: {e}"
+
+    # Defensive: every path above returns, but an implicit None here would
+    # crash process_research's `scraped.startswith(...)` check.
+    return f"Error during scraping: {url} could not be retrieved."
+
+
+def scrape_website(url: str, retries: int = 1, timeout: int = 10) -> str:
+    """Scrapes clean page content via Firecrawl (handles JS-rendered pages),
+    retrying once on failure, then falls back to a raw HTML/<p>-tag scrape
+    if Firecrawl has no API key configured or keeps failing."""
+    firecrawl_api_key = st.secrets.get("FIRECRAWL_API_KEY")
+
+    if firecrawl_api_key:
+        attempts = retries + 1
+        for attempt in range(1, attempts + 1):
+            markdown = _scrape_with_firecrawl(url, firecrawl_api_key, timeout)
+            if markdown:
+                return markdown
+            logger.warning("Firecrawl scrape attempt %d/%d failed for %s", attempt, attempts, url)
+        logger.warning("Firecrawl exhausted retries for %s, falling back to raw HTML scrape", url)
+    else:
+        logger.info("FIRECRAWL_API_KEY not set, using fallback scraper for %s", url)
+
+    return _scrape_with_bs4(url, retries, timeout)
 
 
 def chunk_text(text: str):
@@ -215,22 +358,42 @@ def chunk_text(text: str):
 _chunk_store = {}
 
 
+def _tokenize(text: str) -> list[str]:
+    """Lowercase word-tokenizer for BM25. BM25Okapi scores token lists, not
+    raw strings, so both stored chunks and queries must go through this."""
+    return re.findall(r"\w+", text.lower())
+
+
 def store_in_vector_db(chunks: list, collection_name: str = "financial_research"):
     """
-    Takes text chunks and builds a TF-IDF matrix for similarity search.
+    Takes text chunks and builds a BM25 index for keyword search.
     Replaces the old ChromaDB + HuggingFace embeddings implementation.
     """
     try:
         if not chunks:
             return None
 
-        vectorizer = TfidfVectorizer(stop_words='english')
-        matrix = vectorizer.fit_transform(chunks)
+        # Keep only chunks that produce at least one token. BM25Okapi divides
+        # by the corpus's average document length, so a corpus where every
+        # chunk tokenizes to nothing (e.g. a PDF page of only punctuation)
+        # raises ZeroDivisionError. Filtering keeps `chunks` and the BM25
+        # index index-aligned, which retrieve_context relies on.
+        tokenized = [(c, _tokenize(c)) for c in chunks]
+        usable = [(c, toks) for c, toks in tokenized if toks]
+
+        if not usable:
+            logger.warning(
+                "No searchable text in %d chunk(s) for collection '%s'",
+                len(chunks), collection_name,
+            )
+            return None
+
+        kept_chunks = [c for c, _ in usable]
+        bm25 = BM25Okapi([toks for _, toks in usable])
 
         _chunk_store[collection_name] = {
-            "chunks": chunks,
-            "vectorizer": vectorizer,
-            "matrix": matrix,
+            "chunks": kept_chunks,
+            "bm25": bm25,
         }
         return _chunk_store[collection_name]
 
@@ -241,16 +404,15 @@ def store_in_vector_db(chunks: list, collection_name: str = "financial_research"
 
 def retrieve_context(query: str, k: int = 2, collection_name: str = "financial_research"):
     """
-    Takes a query, computes cosine similarity against stored TF-IDF vectors,
-    and returns the top-k most relevant chunks as a formatted string.
+    Takes a query, scores it against the stored BM25 index, and returns the
+    top-k most relevant chunks as a formatted string.
     """
     try:
         store = _chunk_store.get(collection_name)
         if not store:
             return "No data stored yet."
 
-        query_vec = store["vectorizer"].transform([query])
-        scores = cosine_similarity(query_vec, store["matrix"]).flatten()
+        scores = store["bm25"].get_scores(_tokenize(query))
 
         k = min(k, len(store["chunks"]))
         top_idx = np.argsort(scores)[-k:][::-1]
@@ -262,16 +424,52 @@ def retrieve_context(query: str, k: int = 2, collection_name: str = "financial_r
         return f"Error retrieving context: {e}"
 
 
+def clear_vector_db(collection_name: str = "financial_research") -> None:
+    """Removes a stored collection, if present. Used to reset the uploaded
+    document's index when the user starts a new conversation."""
+    _chunk_store.pop(collection_name, None)
+
+
+def parse_pdf(file) -> str:
+    """Extracts text from a PDF (a file-like object, e.g. from Streamlit's
+    file_uploader). Returns the concatenated text of all pages, or an empty
+    string if extraction fails or the PDF has no extractable text (e.g. it's
+    a scanned image with no selectable text layer)."""
+    try:
+        reader = PdfReader(file)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n\n".join(pages).strip()
+    except Exception:
+        logger.exception("Failed to parse uploaded PDF")
+        return ""
+
+
+@tool
+def query_uploaded_document(question: str) -> str:
+    """Answers questions about a PDF the user has uploaded (e.g. an earnings
+    report or 10-K). Only use this when the user's question refers to an
+    uploaded document, report, or file. Returns the most relevant excerpt(s),
+    or a message saying no document has been uploaded yet."""
+    return retrieve_context(question, k=4, collection_name="uploaded_document")
+
+
 @tool
 def process_research(query: str):
-    """
-    The full Phase 2 Pipeline: Search -> Scrape -> Chunk -> Store -> Retrieve
-    """
+    """Runs deep research on a topic: searches the web, scrapes the best
+    source's full article text, and returns the most relevant passages.
+    Use this - NOT perform_web_search - whenever the user asks to 'research',
+    'deep dive', 'analyze', 'summarize', or wants detail beyond a headline.
+    Returns enough context to answer in one call; do not call it twice for
+    the same question."""
 
     # 1. Search
-    logger.info("[STEP 1] Searching web for: %s", query)
-    search_results = perform_web_search.invoke(query)
-    logger.info("[OK] Search completed")
+    _report(f"🔎 Searching the web for: {query}")
+    try:
+        search_results = _search_web(query)
+    except SearchError as e:
+        _report("⚠️ Search failed")
+        return str(e)
+    _report("✅ Search completed")
 
     # 2. Scrape
     links = re.findall(r'Link:\s*(https?://\S+)', search_results)
@@ -281,7 +479,7 @@ def process_research(query: str):
 
     raw_text = None
     for link in links:
-        logger.info("[STEP 2] Scraping: %s", link)
+        _report(f"🌐 Scraping: {link}")
         scraped = scrape_website(link)
         if not scraped.startswith("Failed to retrieve") and not scraped.startswith("Error"):
             raw_text = scraped
@@ -290,21 +488,24 @@ def process_research(query: str):
     if not raw_text:
         return "All Links are getting blocked. Try New URL..."
 
-    logger.info("[OK] Scraping successful, %d characters extracted", len(raw_text))
+    _report(f"✅ Scraped {len(raw_text)} characters")
 
     # 3. Chunk
     chunks = chunk_text(raw_text)
-    logger.info("[OK] Created %d chunks", len(chunks))
+    _report(f"✂️ Created {len(chunks)} chunks")
 
-    # 4. Store (TF-IDF)
+    # 4. Store (BM25)
     store_in_vector_db(chunks)
-    logger.info("[OK] Stored successfully")
+    _report("📊 Indexed chunks for relevance ranking")
 
     # 5. Retrieve
-    context = retrieve_context(query)
-    logger.info("[OK] Context retrieved")
+    # k=4 (not 2) and a 2000-char cap (not 500): the old limits returned so
+    # little context that the agent often had to make another tool call to
+    # answer, costing more LLM calls than the larger observation does.
+    context = retrieve_context(query, k=4)
+    _report("✅ Context retrieved")
 
-    return context[:500]
+    return context[:2000]
 
 
 if __name__ == "__main__":

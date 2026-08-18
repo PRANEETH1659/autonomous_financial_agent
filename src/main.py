@@ -4,7 +4,8 @@ from langchain_groq import ChatGroq
 from tools import (
     get_stock_info,
     perform_web_search,
-    process_research
+    process_research,
+    query_uploaded_document
 )
 
 from langchain_core.prompts import PromptTemplate
@@ -12,16 +13,36 @@ from langchain.agents import create_react_agent
 from langchain.agents.agent import AgentExecutor
 from langchain.memory import ConversationBufferWindowMemory
 
+# Groq retires models without notice - when a model is decommissioned the API
+# starts returning 404 model_not_found and every query fails. That is what
+# killed the previous llama-3.3-70b-versatile pin. Keep the name in one
+# constant so the next retirement is a one-line fix, and re-check it against
+# GET https://api.groq.com/openai/v1/models if that 404 ever shows up again.
+#
+# Model choice is tied to the agent type below and was picked empirically, not
+# by size. openai/gpt-oss-120b is the bigger model but is unusable with the
+# ReAct agent: it emits a *native* tool call instead of typing "Action:", and
+# Groq rejects that with "Tool choice is none, but model called a tool" because
+# a ReAct agent binds no tools. qwen3.6-27b follows the text protocol reliably.
+# If this model is ever swapped again, re-test the agent type too.
+GROQ_MODEL = "qwen/qwen3.6-27b"
+
 llm = ChatGroq(
-    model_name="llama-3.3-70b-versatile",
+    model_name=GROQ_MODEL,
     temperature=0,
-    api_key=st.secrets["GROQ_API_KEY"]
+    api_key=st.secrets["GROQ_API_KEY"],
+    max_retries=3,
+    # gpt-oss is a reasoning model. Left on the default it can emit its chain of
+    # thought into the message body, which the ReAct parser then reads as a
+    # malformed Thought/Action block. "hidden" keeps the body to the answer only.
+    reasoning_format="hidden",
 )
 
 tools = [
     get_stock_info,
     perform_web_search,
-    process_research
+    process_research,
+    query_uploaded_document
 ]
 
 template = """
@@ -44,13 +65,49 @@ Thought: I now know the final answer
 Final Answer: your response
 
 IMPORTANT RULES:
-* Use at most 2 tool calls.
+* Use at most 2 tool calls, then answer. Fewer is better.
 * Never write Action: None
 * Never invent tool names.
-* Always finish with Final Answer.
+* NEVER repeat a tool call you have already made with the same input. If the
+  Observation above already contains the data, use it — do not call again.
+* After an Observation gives you enough to answer, immediately write
+  "Thought: I now know the final answer" then "Final Answer:". Do not call
+  another tool just to double-check.
+* Every response must contain either an "Action:" line or a "Final Answer:"
+  line — never neither.
+
+TOOL SELECTION (pick exactly one per step):
+* get_stock_info — any question about price, valuation, market cap, P/E, EPS,
+  dividends, or performance of specific companies. Batch all tickers into ONE call.
+* perform_web_search — quick factual/current-events questions answerable from
+  headlines (e.g. "why did Tesla drop today").
+* process_research — when the user says "research", "deep dive", "analyze",
+  "summarize", or wants detail beyond a headline. Never pair this with
+  perform_web_search for the same question.
+* query_uploaded_document — any question about an uploaded document/report/PDF.
+
+BEHAVIOUR RULES:
 * You have memory of the previous conversation — use it to resolve pronouns like "it", "they", "this company" by referring to the chat history below.
 * If the user asks about a short uppercase word (e.g. TTRO, AAPL, NVDA, TEAM), always treat it as a potential stock ticker and call get_stock_info with that ticker directly.
+* If the user asks about two or more companies (e.g. a comparison), call get_stock_info ONCE with all their tickers comma-separated (e.g. "TSLA, NVDA, AAPL") instead of calling it once per company.
 * If get_stock_info returns "Could not find valid stock data", inform the user that the ticker is invalid or the company is private/not publicly traded.
+
+EXAMPLES:
+Question: Do a deep research on Nvidia's AI investments
+Thought: The user asked for deep research, so I should use process_research.
+Action: process_research
+Action Input: Nvidia AI investments
+Observation: <research passages>
+Thought: I now know the final answer
+Final Answer: <summary of the passages>
+
+Question: Compare TSLA and AAPL
+Thought: This is a valuation comparison, so one batched get_stock_info call covers both.
+Action: get_stock_info
+Action Input: TSLA, AAPL
+Observation: <two summaries>
+Thought: I now know the final answer
+Final Answer: <comparison table>
 
 OUTPUT FORMAT RULES:
 * Only use the structured comparison format (Industry / Market Cap / Recent Performance / Key Strengths / Key Risks / Overall Comparison) when the user EXPLICITLY asks to compare two or more companies.
@@ -87,7 +144,10 @@ agent_executor = AgentExecutor(
     tools=tools,
     verbose=False,
     handle_parsing_errors="Please provide a Final Answer.",
-    max_iterations=15,
+    # Each iteration is one LLM call. A normal answer takes 2-3; 8 leaves
+    # headroom for a format retry while capping the worst case at roughly
+    # half what 15 could burn on a runaway loop.
+    max_iterations=8,
     early_stopping_method="generate",
     memory=memory
 )
