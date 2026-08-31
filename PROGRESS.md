@@ -1,6 +1,6 @@
 # Autonomous Financial Research Agent — Progress Tracker
 
-Last updated: 2026-08-15
+Last updated: 2026-08-31
 
 A living record of what this project is, what's been built, what's currently broken or in flux, and what's next. Sections with `<details>` are collapsible — click to expand.
 
@@ -19,6 +19,20 @@ The LLM is the decision-maker: it reads the user's question, picks a tool (or tw
 ---
 
 ## 2. Current status
+
+<details open>
+<summary><strong>✅ Chat rendering + chart-cost pass — three UI-layer bugs fixed (2026-08-31)</strong></summary>
+
+All three sit in `app.py` and were invisible to the eval suite, which asserts *tool selection* and never looks at what Streamlit actually renders:
+
+- **Dollar amounts silently ate the text between them** — Streamlit renders answers as markdown, where a `$...$` pair is LaTeX math. Financial answers are dense with dollar figures ("revenue of $11.62B against $47.06B in..."), so any answer containing an **even** number of `$` had the span between the first and last one swallowed into a math block. New `escape_dollars()` escapes every `$` before `st.markdown`, applied to both live answers and replayed history.
+- **Charts are now opt-in** — a chart was drawn on *every* turn, and `find_ticker_in_text` probes up to 5 candidate tickers through yfinance at a different cache key than the agent's own lookup. Those speculative probes are the calls that get the app rate-limited on shared cloud IPs. A chart is now drawn only when the user actually asks (`wants_chart()` — "chart/graph/trend/performance/over time"...) or when the new sidebar **"Always show charts"** toggle is on. Replayed history only redraws charts for turns that genuinely had one, so old messages no longer sprout charts the user never asked for.
+- **`$nan` / `+nan%` metrics during market hours** — yfinance returns a partial row for the in-progress session with `Volume` populated but OHLC still empty, so Last Close and 6-Month Change rendered as `nan` while Day Volume looked perfectly fine. `render_chart_block()` now drops NaN-`Close` rows first, which also removes the trailing flat gap from the chart line.
+- Chart rendering was duplicated between the live path and the history-replay path; both now go through one `render_chart_block(ticker, show_metrics=...)`.
+
+**Verification:** all four `src/` modules compile clean, and `app.py` was executed top-to-bottom in Streamlit bare mode (exit 0, agent built, no exceptions) plus booted headless over HTTP. The eval suite was **not** re-run — these changes are below the layer it tests.
+
+</details>
 
 <details open>
 <summary><strong>✅ Robustness pass — 6 latent crash/correctness bugs found and fixed, eval now 11/11 (2026-08-15)</strong></summary>
@@ -264,6 +278,7 @@ After many restarts during the Gemini/Groq back-and-forth, two separate Streamli
 | 2026-08-09 | Firecrawl scraping integration (with BS4 fallback) + live pipeline visualization (`st.status` panel + tool-selection callback) — both verified via live browser tests |
 | 2026-08-09 (evening) | Manual stress-testing surfaced two real bugs, both fixed same-day: chart/answer ticker mismatch, and 3x redundant `get_stock_info` calls on multi-company questions (fixed via batched comma-separated ticker input) — all verified via live browser + status-panel captures |
 | 2026-08-15 | Retrieval upgraded TF-IDF → **BM25** (dropped sklearn/scipy); **PDF upload + document Q&A** added; **LLM-call optimization pass** (every query down to exactly 2 calls, bare tickers to 0 via a fast path); **robustness pass** fixing 6 latent crash/correctness bugs. Eval 7/9 → **11/11**, suite extended with a call-budget guard and a document-routing case |
+| 2026-08-31 | UI-layer pass on `app.py`: dollar amounts no longer swallowed by Streamlit's LaTeX rendering, charts made opt-in (cutting the speculative yfinance probes behind rate-limiting), and `$nan` metrics during market hours fixed |
 
 ---
 

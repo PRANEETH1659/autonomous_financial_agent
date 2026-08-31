@@ -90,6 +90,60 @@ def try_bare_ticker_fast_path(text: str) -> tuple[str, str] | None:
     return summary, normalized
 
 
+def escape_dollars(text: str) -> str:
+    """Streamlit renders markdown, where a `$...$` pair is LaTeX math. Stock
+    answers are full of dollar amounts ("$11.62 ... $47.06 billion"), so an
+    even number of them silently swallows the text in between into a math
+    block. Escaping every $ keeps prices rendering as prices."""
+    return text.replace("$", r"\$")
+
+
+# Charts are supplementary, not part of every answer. Rendering one every turn
+# also costs extra yfinance calls - find_ticker_in_text probes up to 5 candidate
+# tickers at a different cache key than the agent's own lookup - and those extra
+# calls are what get this app rate-limited on shared cloud IPs.
+CHART_REQUEST_PATTERN = re.compile(
+    r"(chart|charts|graph|plot|trend|trending|history|historical|"
+    r"performance|price action|movement|visuali[sz]e|over time)",
+    re.IGNORECASE,
+)
+
+
+def wants_chart(text: str) -> bool:
+    """True when the user actually asked to see a chart."""
+    return bool(CHART_REQUEST_PATTERN.search(text))
+
+
+def render_chart_block(ticker: str, show_metrics: bool = True) -> None:
+    """Draws the price chart, and optionally the metric row, for a ticker.
+
+    Rows with a NaN Close are dropped first: yfinance returns a partial row for
+    the in-progress trading session with Volume already filled in but OHLC still
+    empty, which otherwise renders as "$nan" and "+nan%" while Day Volume looks
+    fine. Dropping them also takes the trailing gap out of the chart line."""
+    hist = get_stock_history(ticker, period="6mo")
+    if hist is None:
+        return
+
+    hist = hist.dropna(subset=["Close"])
+    if hist.empty:
+        return
+
+    st.caption(f"📊 Chart & metrics: {ticker}")
+
+    if show_metrics:
+        latest = hist.iloc[-1]
+        first_close = hist["Close"].iloc[0]
+        change_pct = (latest["Close"] - first_close) / first_close * 100
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Last Close", f"${latest['Close']:.2f}")
+        col2.metric("6-Month Change", f"{change_pct:+.2f}%")
+        col3.metric("Day Volume", f"{int(latest['Volume']):,}")
+
+    st.line_chart(hist["Close"])
+
+
 with st.sidebar:
     st.header("📈 Financial Research Agent")
     st.markdown(
@@ -99,6 +153,13 @@ with st.sidebar:
     st.markdown(
         "**Available tools:**\n- Live stock data (yfinance)\n- Web search\n"
         "- Deep research pipeline\n- Uploaded document Q&A"
+    )
+
+    always_show_charts = st.toggle(
+        "Always show charts",
+        value=False,
+        help="Off by default. A chart is still drawn automatically whenever "
+             "you ask for one, e.g. 'show me Tesla's performance'.",
     )
 
     st.divider()
@@ -155,13 +216,11 @@ if "messages" not in st.session_state:
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        ticker = message.get("ticker")
-        if ticker:
-            hist = get_stock_history(ticker, period="6mo")
-            if hist is not None:
-                st.caption(f"📊 Chart: {ticker}")
-                st.line_chart(hist["Close"])
+        st.markdown(escape_dollars(message["content"]))
+        # Only set when a chart was actually asked for that turn, so replaying
+        # history doesn't resurrect charts the user never wanted.
+        if message.get("ticker"):
+            render_chart_block(message["ticker"], show_metrics=False)
 
 if prompt := st.chat_input("What would you like to research?"):
 
@@ -211,27 +270,20 @@ if prompt := st.chat_input("What would you like to research?"):
                 finally:
                     set_progress_callback(None)
 
-        st.markdown(answer)
+        st.markdown(escape_dollars(answer))
 
-        # Prefer a ticker actually named in the answer (what the agent's
-        # conclusion is about) over one merely mentioned in the user's
-        # prompt - otherwise a 3-way comparison would silently chart
-        # whichever company was typed first, regardless of the answer.
-        ticker = fast_ticker or find_ticker_in_text(answer) or find_ticker_in_text(prompt)
-        if ticker:
-            hist = get_stock_history(ticker, period="6mo")
-            if hist is not None:
-                latest = hist.iloc[-1]
-                first_close = hist["Close"].iloc[0]
-                change_pct = (latest["Close"] - first_close) / first_close * 100
-
-                st.caption(f"📊 Chart & metrics: {ticker}")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Last Close", f"${latest['Close']:.2f}")
-                col2.metric("6-Month Change", f"{change_pct:+.2f}%")
-                col3.metric("Day Volume", f"{int(latest['Volume']):,}")
-
-                st.line_chart(hist["Close"])
+        # A chart is supplementary detail, not part of every answer - draw one
+        # only when the user asked, or when they've pinned the sidebar toggle
+        # on. Skipping this also skips find_ticker_in_text's yfinance probes.
+        ticker = None
+        if always_show_charts or wants_chart(prompt):
+            # Prefer a ticker actually named in the answer (what the agent's
+            # conclusion is about) over one merely mentioned in the user's
+            # prompt - otherwise a 3-way comparison would silently chart
+            # whichever company was typed first, regardless of the answer.
+            ticker = fast_ticker or find_ticker_in_text(answer) or find_ticker_in_text(prompt)
+            if ticker:
+                render_chart_block(ticker)
 
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "ticker": ticker}

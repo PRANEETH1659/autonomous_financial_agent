@@ -9,3 +9,6 @@ __pycache__/
 
 chroma_db/
 .DS_Store
+
+# Personal interview prep - kept local, not for the public repo
+INTERVIEW_MASTERY.html
