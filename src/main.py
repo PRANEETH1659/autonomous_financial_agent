@@ -174,6 +174,11 @@ agent_executor = AgentExecutor(
     # headroom for a format retry while capping the worst case at roughly
     # half what 15 could burn on a runaway loop.
     max_iterations=8,
-    early_stopping_method="generate",
+    # "generate" was accepted by the LangChain version this was written
+    # against, but current versions raise ValueError("Got unsupported
+    # early_stopping_method") the moment max_iterations is actually hit -
+    # turning a graceful stop into a crash. "force" is the supported value:
+    # it stops and returns the stop message instead of a broken run.
+    early_stopping_method="force",
     memory=memory
 )
