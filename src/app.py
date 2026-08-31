@@ -4,7 +4,7 @@ import re
 import streamlit as st
 from langchain_core.callbacks import BaseCallbackHandler
 
-from main import agent_executor
+from main import agent_executor, get_rate_limits, GROQ_MODEL
 from tools import (
     get_stock_history,
     validate_ticker,
@@ -28,6 +28,48 @@ class ToolSelectionReporter(BaseCallbackHandler):
 
     def on_agent_action(self, action, **kwargs):
         self.status.write(f"🤖 Using tool: **{action.tool}** — `{action.tool_input}`")
+
+
+class TokenUsageTracker(BaseCallbackHandler):
+    """Accumulates Groq token spend across a session.
+
+    Counts on on_llm_end rather than on_llm_start because the token figures
+    only exist once the response comes back. A ReAct turn fires this once per
+    iteration, so calls_this_query doubles as the per-query LLM-call count
+    that the eval suite's budget guard asserts on."""
+
+    def __init__(self, stats: dict):
+        self.stats = stats
+
+    @staticmethod
+    def _extract_usage(response) -> tuple[int, int]:
+        """Returns (prompt_tokens, completion_tokens) from either shape.
+
+        The AgentExecutor streams, and on a streamed run LangChain leaves
+        response.llm_output as None and hangs the counts off the aggregated
+        AIMessageChunk as usage_metadata (input_tokens/output_tokens) instead.
+        A non-streamed call populates llm_output["token_usage"] with the
+        prompt_tokens/completion_tokens spelling. Reading only the latter is
+        why this panel first showed 0 while the quota bars visibly moved."""
+        for gen_list in response.generations:
+            for gen in gen_list:
+                usage = getattr(getattr(gen, "message", None), "usage_metadata", None)
+                if usage:
+                    return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+
+        fallback = (response.llm_output or {}).get("token_usage") or {}
+        return fallback.get("prompt_tokens", 0), fallback.get("completion_tokens", 0)
+
+    def on_llm_end(self, response, **kwargs):
+        prompt_tokens, completion_tokens = self._extract_usage(response)
+        total = prompt_tokens + completion_tokens
+
+        self.stats["calls"] += 1
+        self.stats["calls_this_query"] += 1
+        self.stats["prompt_tokens"] += prompt_tokens
+        self.stats["completion_tokens"] += completion_tokens
+        self.stats["total_tokens"] += total
+        self.stats["tokens_this_query"] += total
 
 st.set_page_config(
     page_title="AI Financial Research Agent",
@@ -103,8 +145,8 @@ def escape_dollars(text: str) -> str:
 # tickers at a different cache key than the agent's own lookup - and those extra
 # calls are what get this app rate-limited on shared cloud IPs.
 CHART_REQUEST_PATTERN = re.compile(
-    r"(chart|charts|graph|plot|trend|trending|history|historical|"
-    r"performance|price action|movement|visuali[sz]e|over time)",
+    r"\b(chart|charts|graph|plot|trend|trending|history|historical|"
+    r"performance|price action|movement|visuali[sz]e|over time)\b",
     re.IGNORECASE,
 )
 
@@ -144,6 +186,88 @@ def render_chart_block(ticker: str, show_metrics: bool = True) -> None:
     st.line_chart(hist["Close"])
 
 
+if "token_stats" not in st.session_state:
+    st.session_state.token_stats = {
+        "calls": 0, "queries": 0, "prompt_tokens": 0,
+        "completion_tokens": 0, "total_tokens": 0,
+        "calls_this_query": 0, "tokens_this_query": 0,
+    }
+
+def _pretty_reset(raw: str) -> str:
+    """Groq reports resets as '2m52.8s' / '90ms' / '1h2m3s'. Sub-second values
+    are noise on a dashboard, so they collapse to 'moments'."""
+    if not raw:
+        return "unknown"
+    if re.fullmatch(r"[\d.]+ms", raw):
+        return "moments"
+    return raw
+
+
+def render_quota(placeholder) -> None:
+    """Draws the usage panel into a sidebar placeholder.
+
+    Written into a placeholder rather than inline because Streamlit renders
+    the sidebar before the chat block runs - drawn inline, the numbers would
+    always be one query stale. The placeholder is filled once on load and
+    refilled after the agent answers."""
+    stats = st.session_state.token_stats
+    limits = get_rate_limits()
+
+    with placeholder.container():
+        st.subheader("📊 Token usage")
+        st.caption(f"Model: `{GROQ_MODEL}`")
+
+        if stats["queries"]:
+            st.caption(
+                f"{stats['calls']} LLM call(s) over {stats['queries']} "
+                f"quer{'y' if stats['queries'] == 1 else 'ies'} "
+                f"— {stats['calls'] / stats['queries']:.1f} per query"
+            )
+        else:
+            st.caption("No queries yet this session.")
+
+        col1, col2 = st.columns(2)
+        col1.metric("Session tokens", f"{stats['total_tokens']:,}")
+        col2.metric("Last query", f"{stats['tokens_this_query']:,}")
+        st.caption(
+            f"in {stats['prompt_tokens']:,} · out {stats['completion_tokens']:,}"
+        )
+
+        # Straight from Groq's rate-limit headers on the agent's own calls.
+        if limits:
+            req_left = limits.get("x-ratelimit-remaining-requests")
+            req_max = limits.get("x-ratelimit-limit-requests")
+            tok_left = limits.get("x-ratelimit-remaining-tokens")
+            tok_max = limits.get("x-ratelimit-limit-tokens")
+
+            st.markdown("**Groq quota remaining**")
+            if req_left and req_max:
+                st.progress(
+                    int(req_left) / int(req_max),
+                    text=f"Requests: {int(req_left):,} / {int(req_max):,} per day",
+                )
+                st.caption(
+                    "↻ full reset in "
+                    f"{_pretty_reset(limits.get('x-ratelimit-reset-requests', ''))}"
+                )
+            if tok_left and tok_max:
+                st.progress(
+                    int(tok_left) / int(tok_max),
+                    text=f"Tokens: {int(tok_left):,} / {int(tok_max):,} per minute",
+                )
+                st.caption(
+                    "↻ full reset in "
+                    f"{_pretty_reset(limits.get('x-ratelimit-reset-tokens', ''))}"
+                )
+            st.caption(
+                "Both budgets refill continuously rather than emptying and "
+                "resetting on a clock - the times above are how long until "
+                "each is back to full."
+            )
+        else:
+            st.caption("Groq quota shows after the first LLM call.")
+
+
 with st.sidebar:
     st.header("📈 Financial Research Agent")
     st.markdown(
@@ -161,6 +285,10 @@ with st.sidebar:
         help="Off by default. A chart is still drawn automatically whenever "
              "you ask for one, e.g. 'show me Tesla's performance'.",
     )
+
+    st.divider()
+    quota_placeholder = st.empty()
+    render_quota(quota_placeholder)
 
     st.divider()
     st.subheader("📄 Upload a report")
@@ -224,6 +352,13 @@ for message in st.session_state.messages:
 
 if prompt := st.chat_input("What would you like to research?"):
 
+    # Reset per-query counters here rather than in the tracker, so the
+    # zero-LLM fast path also clears the previous query's numbers instead of
+    # leaving them on screen looking like they belong to this one.
+    st.session_state.token_stats["queries"] += 1
+    st.session_state.token_stats["calls_this_query"] = 0
+    st.session_state.token_stats["tokens_this_query"] = 0
+
     st.session_state.messages.append(
         {"role": "user", "content": prompt}
     )
@@ -246,11 +381,12 @@ if prompt := st.chat_input("What would you like to research?"):
             with st.status("Researching...", expanded=True) as status:
                 set_progress_callback(status.write)
                 reporter = ToolSelectionReporter(status)
+                usage = TokenUsageTracker(st.session_state.token_stats)
 
                 try:
                     response = agent_executor.invoke(
                         {"input": prompt},
-                        config={"callbacks": [reporter]},
+                        config={"callbacks": [reporter, usage]},
                     )
 
                     answer = response.get(
@@ -288,3 +424,7 @@ if prompt := st.chat_input("What would you like to research?"):
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "ticker": ticker}
     )
+
+    # The sidebar rendered before this query ran, so repaint the panel now
+    # that the tokens are actually spent and fresh quota headers are in.
+    render_quota(quota_placeholder)

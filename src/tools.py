@@ -119,12 +119,21 @@ def _get_stock_info_for_one(ticker: str) -> str:
     week_52_high = _format_number(info.get('fiftyTwoWeekHigh'))
     avg_volume = _format_number(info.get('averageVolume'))
 
+    # During market hours yfinance appends a partial row for the in-progress
+    # session: Volume is populated but OHLC is still NaN. `hist` is therefore
+    # not empty, so the guard below passes and iloc[-1] reads those NaNs -
+    # surfacing as "Open: nan ... 6-month change: nan%" both to the user and,
+    # worse, to the LLM as tool output it then reasons from. app.py's
+    # render_chart_block drops these rows for the chart; the text summary
+    # needs the same treatment.
+    hist = hist.dropna(subset=['Open', 'Close', 'High', 'Low'])
+
     if not hist.empty:
         last_day_data = hist.iloc[-1]
-        last_open = last_day_data['Open']
-        last_close = last_day_data['Close']
-        last_high = last_day_data['High']
-        last_low = last_day_data['Low']
+        last_open = f"{last_day_data['Open']:.2f}"
+        last_close = f"{last_day_data['Close']:.2f}"
+        last_high = f"{last_day_data['High']:.2f}"
+        last_low = f"{last_day_data['Low']:.2f}"
 
         period_change = (
             (hist['Close'].iloc[-1] - hist['Close'].iloc[0])

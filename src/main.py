@@ -1,3 +1,4 @@
+import httpx
 import streamlit as st
 from langchain_groq import ChatGroq
 
@@ -27,6 +28,30 @@ from langchain.memory import ConversationBufferWindowMemory
 # If this model is ever swapped again, re-test the agent type too.
 GROQ_MODEL = "qwen/qwen3.6-27b"
 
+# --- Live Groq quota tracking -------------------------------------------------
+# Groq reports the account's remaining budget in rate-limit response headers,
+# but langchain-groq surfaces only the parsed body, not the headers. Rather
+# than spend a request pinging the API just to read them, an httpx response
+# hook reads them off the agent's own calls - so this costs zero extra calls
+# and is always as fresh as the last thing the agent did.
+#
+# Account-wide by nature (the quota belongs to the API key, not the visitor),
+# so module-level state is the right scope here - unlike per-user chat state.
+_RATE_LIMITS: dict[str, str] = {}
+
+
+def _capture_rate_limits(response: httpx.Response) -> None:
+    _RATE_LIMITS.update(
+        {k.lower(): v for k, v in response.headers.items()
+         if k.lower().startswith("x-ratelimit-")}
+    )
+
+
+def get_rate_limits() -> dict[str, str]:
+    """Latest Groq rate-limit headers seen. Empty until the first LLM call."""
+    return dict(_RATE_LIMITS)
+
+
 llm = ChatGroq(
     model_name=GROQ_MODEL,
     temperature=0,
@@ -36,6 +61,7 @@ llm = ChatGroq(
     # thought into the message body, which the ReAct parser then reads as a
     # malformed Thought/Action block. "hidden" keeps the body to the answer only.
     reasoning_format="hidden",
+    http_client=httpx.Client(event_hooks={"response": [_capture_rate_limits]}),
 )
 
 tools = [

@@ -21,6 +21,18 @@ The LLM is the decision-maker: it reads the user's question, picks a tool (or tw
 ## 2. Current status
 
 <details open>
+<summary><strong>✅ Live token/quota panel, a chart regression caught by new unit tests, and deploy prep (2026-08-31, later)</strong></summary>
+
+- **Live Groq usage panel in the sidebar** — shows the active model, tokens spent this session and on the last query (split in/out), LLM calls per query, and the account's **remaining quota with time-to-refill**, read live from Groq's `x-ratelimit-*` response headers. `langchain-groq` doesn't surface headers, so rather than spend a request polling for them, `main.py` hands `ChatGroq` an httpx client with a response hook that reads them off the agent's own calls — **zero extra API calls**. Consumption is a `TokenUsageTracker` callback alongside the existing `ToolSelectionReporter`.
+  - Gotcha worth remembering: the panel first read **0 tokens while the quota bars visibly moved**. The `AgentExecutor` streams, and on a streamed run LangChain leaves `llm_output` as `None` and hangs the counts on the aggregated `AIMessageChunk` as `usage_metadata` — with *different key names* (`input_tokens` vs `prompt_tokens`). A direct `llm.invoke` populates the other shape. `_extract_usage` now reads both.
+- **[RED] `wants_chart()` never matched anything — regression, shipped in `b8b84c5`.** The chart-intent regex contained two literal **0x08 backspace bytes** where `` word boundaries were intended, inside an `r"..."` string. The pattern therefore required a real backspace character and could never match, so "show me Tesla's performance" silently drew no chart — the opt-in charts feature was inert for every user who didn't find the sidebar toggle. Invisible to review (a terminal renders 0x08 as nothing) and missed by manual testing because that testing used the **toggle**, which short-circuits `wants_chart` via `always_show_charts or wants_chart(prompt)`. Found only when the new unit tests asserted on it directly.
+- **`get_stock_summary` reported `nan` during market hours** — same partial-row cause as the chart fix, one layer down and never fixed there. yfinance appends an in-progress-session row with Volume set but OHLC still `NaN`; `hist` is therefore not empty, so the guard passed and `iloc[-1]` read NaNs. The answer text showed `Open: nan ... 6-month change: nan%` — and, worse, fed those `nan`s to the LLM as tool output to reason from. Now drops NaN OHLC rows and formats to 2dp.
+- **Unit test suite added — `tests/`, 146 passing.** Mocked and offline (pytest + pytest-mock), so unlike `eval_agent.py` it costs no API quota and can run on every commit. `conftest.py` fakes `st.secrets`, pins `ChatGroq` to a `MagicMock` so no key is ever needed, and clears `tools._chunk_store` / `main._RATE_LIMITS` around every test so process-global state can't leak between them. This suite paid for itself immediately by catching the backspace regression above.
+- **`requirements.txt` moved to the repo root** (`git mv` from `src/`) — Streamlit Cloud looks for it there, and it sitting in `src/` was a latent first-deploy install failure. Audited for Linux compatibility while moving: 97 pins, no `pywin32`/`pywinpty`, no local paths.
+
+</details>
+
+<details open>
 <summary><strong>✅ Chat rendering + chart-cost pass — three UI-layer bugs fixed (2026-08-31)</strong></summary>
 
 All three sit in `app.py` and were invisible to the eval suite, which asserts *tool selection* and never looks at what Streamlit actually renders:
@@ -279,6 +291,7 @@ After many restarts during the Gemini/Groq back-and-forth, two separate Streamli
 | 2026-08-09 (evening) | Manual stress-testing surfaced two real bugs, both fixed same-day: chart/answer ticker mismatch, and 3x redundant `get_stock_info` calls on multi-company questions (fixed via batched comma-separated ticker input) — all verified via live browser + status-panel captures |
 | 2026-08-15 | Retrieval upgraded TF-IDF → **BM25** (dropped sklearn/scipy); **PDF upload + document Q&A** added; **LLM-call optimization pass** (every query down to exactly 2 calls, bare tickers to 0 via a fast path); **robustness pass** fixing 6 latent crash/correctness bugs. Eval 7/9 → **11/11**, suite extended with a call-budget guard and a document-routing case |
 | 2026-08-31 | UI-layer pass on `app.py`: dollar amounts no longer swallowed by Streamlit's LaTeX rendering, charts made opt-in (cutting the speculative yfinance probes behind rate-limiting), and `$nan` metrics during market hours fixed |
+| 2026-08-31 (later) | Live Groq token/quota panel (usage + remaining + refill time, zero extra API calls); `nan` fixed in `get_stock_summary`; **146-test offline pytest suite added**, which immediately caught a shipped regression that made `wants_chart()` match nothing; `requirements.txt` moved to root for deployment |
 
 ---
 
