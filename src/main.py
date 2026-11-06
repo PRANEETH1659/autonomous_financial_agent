@@ -1,3 +1,6 @@
+import logging
+import re
+
 import httpx
 import streamlit as st
 from langchain_groq import ChatGroq
@@ -14,6 +17,8 @@ from langchain.agents import create_react_agent
 from langchain.agents.agent import AgentExecutor
 from langchain.memory import ConversationBufferWindowMemory
 
+logger = logging.getLogger(__name__)
+
 # Groq retires models without notice - when a model is decommissioned the API
 # starts returning 404 model_not_found and every query fails. That is what
 # killed the previous llama-3.3-70b-versatile pin. Keep the name in one
@@ -24,9 +29,64 @@ from langchain.memory import ConversationBufferWindowMemory
 # by size. openai/gpt-oss-120b is the bigger model but is unusable with the
 # ReAct agent: it emits a *native* tool call instead of typing "Action:", and
 # Groq rejects that with "Tool choice is none, but model called a tool" because
-# a ReAct agent binds no tools. qwen3.6-27b follows the text protocol reliably.
+# a ReAct agent binds no tools. qwen3.x-27b follows the text protocol reliably
+# (3.6 was retired; 3.8 is its successor).
 # If this model is ever swapped again, re-test the agent type too.
-GROQ_MODEL = "qwen/qwen3.6-27b"
+PREFERRED_GROQ_MODEL = "qwen/qwen3.8-27b"
+
+# Only the Qwen family has been verified against this ReAct agent, so it is the
+# only family auto-selection may fall back to (see the gpt-oss note above).
+_FALLBACK_MODEL_PREFIX = "qwen/qwen"
+
+
+def _model_version(model_id: str) -> tuple:
+    """Sort key so qwen3.10 outranks qwen3.8: compare the numbers, not the text."""
+    return tuple(int(n) for n in re.findall(r"\d+", model_id))
+
+
+def resolve_groq_model(preferred: str, api_key: str, timeout: float = 5.0) -> str:
+    """Return `preferred` if Groq still serves it, else the newest Qwen model it
+    does serve. Any failure to ask (network down, bad key) keeps `preferred`:
+    guessing wrong there would be worse than the plain error the user would
+    get anyway, and it must never stop the app from starting."""
+    try:
+        resp = httpx.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        available = [m["id"] for m in resp.json().get("data", [])]
+    except Exception as e:
+        logger.warning("Could not verify Groq model list (%s); keeping %s", e, preferred)
+        return preferred
+
+    if preferred in available:
+        return preferred
+    candidates = [m for m in available if m.startswith(_FALLBACK_MODEL_PREFIX)]
+    if not candidates:
+        logger.error("%s is gone and no Qwen replacement is available", preferred)
+        return preferred
+    chosen = max(candidates, key=_model_version)
+    logger.warning("%s is no longer available; falling back to %s", preferred, chosen)
+    return chosen
+
+
+def friendly_llm_error(exc: Exception) -> str | None:
+    """Plain-language message for LLM failures a user can't act on from the raw
+    API text, or None if the error isn't one we recognise."""
+    text = str(exc)
+    if "model_not_found" in text or "does not exist or you do not have access" in text:
+        return ("The AI model behind this app is currently unavailable. "
+                "Please restart the app so it can pick a replacement, "
+                "or contact the owner if this keeps happening.")
+    if "429" in text or "rate_limit" in text.lower():
+        return ("The daily AI usage limit has been reached. "
+                "Please try again later.")
+    return None
+
+
+GROQ_MODEL = resolve_groq_model(PREFERRED_GROQ_MODEL, st.secrets["GROQ_API_KEY"])
 
 # --- Live Groq quota tracking -------------------------------------------------
 # Groq reports the account's remaining budget in rate-limit response headers,
@@ -116,6 +176,7 @@ BEHAVIOUR RULES:
 * You have memory of the previous conversation — use it to resolve pronouns like "it", "they", "this company" by referring to the chat history below.
 * If the user asks about a short uppercase word (e.g. TTRO, AAPL, NVDA, TEAM), always treat it as a potential stock ticker and call get_stock_info with that ticker directly.
 * If the user asks about two or more companies (e.g. a comparison), call get_stock_info ONCE with all their tickers comma-separated (e.g. "TSLA, NVDA, AAPL") instead of calling it once per company.
+* Never swap a product, model or company the user named for a different one you think they meant. Search for their exact wording. If the results do not mention it, say you could not find that product and ask what they meant — you may suggest a likely candidate, but do not answer about it as if it were what they asked.
 * If get_stock_info returns "Could not find valid stock data", inform the user that the ticker is invalid or the company is private/not publicly traded.
 
 EXAMPLES:

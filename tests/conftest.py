@@ -48,6 +48,16 @@ _BASE_SECRETS = {
 
 st.secrets = FakeSecrets(_BASE_SECRETS)
 
+import httpx  # noqa: E402
+
+
+def _no_network(*args, **kwargs):
+    raise httpx.ConnectError("network disabled in tests")
+
+
+# main.py asks Groq for its model list at import time; keep that offline.
+httpx.get = _no_network
+
 import langchain_groq  # noqa: E402
 langchain_groq.ChatGroq = MagicMock(name="ChatGroqClass")
 

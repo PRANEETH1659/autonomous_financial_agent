@@ -4,7 +4,7 @@ import re
 import streamlit as st
 from langchain_core.callbacks import BaseCallbackHandler
 
-from main import agent_executor, get_rate_limits, GROQ_MODEL
+from main import agent_executor, get_rate_limits, friendly_llm_error, GROQ_MODEL
 from tools import (
     get_stock_history,
     validate_ticker,
@@ -397,7 +397,7 @@ if prompt := st.chat_input("What would you like to research?"):
 
                 except Exception as e:
                     logger.exception("Agent execution failed for prompt: %s", prompt)
-                    answer = (
+                    answer = friendly_llm_error(e) or (
                         "Something went wrong while researching that. "
                         f"Details: {e}"
                     )
